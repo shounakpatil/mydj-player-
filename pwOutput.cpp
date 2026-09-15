@@ -1,6 +1,9 @@
 #include "pwOutput.h"
 #include "readHeader.h"
 #include<bits/stdc++.h>
+#include <cerrno>
+#include <termios.h>
+#include <unistd.h>
 #include <utility>
 #include <spa/param/audio/format-utils.h>
 #include <pipewire/pipewire.h>
@@ -9,6 +12,46 @@
 
 #define DEFAULT_RATE 44100
 #define DEFAULT_VOLUME 0.7
+
+static void pause_stream(struct pw_stream *stream, bool pause)
+{
+    pw_stream_set_active(stream, !pause);
+}
+
+static void on_stdin(void *userdata, int fd, uint32_t mask)
+{
+    auto *data = static_cast<AppData *>(userdata);
+
+    if ((mask & SPA_IO_IN) == 0)
+        return;
+
+    char command;
+    const ssize_t bytes_read = read(fd, &command, sizeof(command));
+    if (bytes_read <= 0)
+    {
+        pw_main_loop_quit(data->loop);
+        return;
+    }
+
+    if (command == 'p' || command == 'P')
+    {
+        data->paused = !data->paused;
+        pause_stream(data->stream, data->paused);
+        pw_log_info("playback %s", data->paused ? "paused" : "resumed");
+    }
+    else if (command == 'q' || command == 'Q')
+        pw_main_loop_quit(data->loop);
+    else if (command =='+' || command == '=')
+    {
+        data->volume=std::min(data->volume +0.1f, 1.0f);
+        pw_log_info("Volume increased to %.1f", data->volume);
+    }
+    else if (command =='-'|| command == '_')
+    {
+        data->volume=std::max(data->volume -0.1f, 0.0f);
+        pw_log_info("Volume decreased to %.1f", data->volume);
+    }
+}
 
 static void on_process(void *userdata)
 {
@@ -52,6 +95,13 @@ static void on_process(void *userdata)
                     silence_frames * stride);
     }
 
+    const float volume=data->volume;
+    const size_t total=n_frames*data->channels;
+    for (size_t i=0;i<total; i++)
+    {
+        dst[i]=static_cast<int16_t>(std::clamp(static_cast<int32_t>(dst[i]*volume), -32768, 32767));
+    }
+
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->stride = static_cast<int32_t>(stride);
     buf->datas[0].chunk->size = static_cast<uint32_t>(n_frames * stride);
@@ -67,6 +117,7 @@ void playWav(struct wavHeader header)
     AppData app_data{};
     app_data.channels = header.numChannels;
     app_data.pcm_buffer = std::move(header.pcm_data);
+    app_data.volume = DEFAULT_VOLUME;
     const struct spa_pod *params[1];
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
@@ -97,6 +148,7 @@ void playWav(struct wavHeader header)
 
     params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info);
 
+    
     pw_stream_connect(app_data.stream,
                       PW_DIRECTION_OUTPUT,
                       PW_ID_ANY,
@@ -106,7 +158,27 @@ void playWav(struct wavHeader header)
                           PW_STREAM_FLAG_RT_PROCESS),
                       params, 1);
 
+    struct termios original_terminal{};
+    const bool terminal_configured = isatty(STDIN_FILENO) != 0 &&
+                                     tcgetattr(STDIN_FILENO, &original_terminal) == 0;
+    if (terminal_configured)
+    {
+        struct termios raw_terminal = original_terminal;
+        cfmakeraw(&raw_terminal);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw_terminal);
+    }
+
+    pw_loop_add_io(pw_main_loop_get_loop(app_data.loop),
+                   STDIN_FILENO,
+                   SPA_IO_IN,
+                   false,
+                   on_stdin,
+                   &app_data);
+
     pw_main_loop_run(app_data.loop);
+
+    if (terminal_configured)
+        tcsetattr(STDIN_FILENO, TCSANOW, &original_terminal);
 
     pw_stream_destroy(app_data.stream);
     pw_main_loop_destroy(app_data.loop);

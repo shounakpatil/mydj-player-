@@ -13,6 +13,8 @@ struct AppData {
     uint16_t channels;
     std::vector<int16_t> pcm_buffer;
     size_t current_frame_index;
+    bool paused;
+    float volume;
 };
 
 void playWav(struct wavHeader header);
